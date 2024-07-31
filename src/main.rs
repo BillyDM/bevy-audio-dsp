@@ -3,18 +3,49 @@ use std::{
     time::{Duration, Instant},
 };
 
+use arrayvec::ArrayVec;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 
-mod util;
+mod built_in_nodes;
+mod graph;
 
-const MAX_BLOCK_SIZE: usize = 256;
+pub mod node;
+pub mod util;
+
+pub use graph::buffer_pool::{BlockBuffer, BlockFrames, BlockRange};
+pub use node::{MAX_IN_CHANNELS, MAX_OUT_CHANNELS};
+
+use graph::{
+    buffer_pool::BufferPool,
+    node_pool::NodeProcessorPool,
+    schedule::{NodeID, Schedule},
+    CompiledAudioGraph,
+};
+use node::ProcessContext;
+
+pub const MAX_BLOCK_SIZE: usize = 128;
 const GUI_TO_AUDIO_MSG_SIZE: usize = 2048;
 
 fn main() {
     env_logger::init();
 
     let mut audio = AudioResource::new();
+
+    let nodes = vec![];
+
+    let mut output_buffer_ids = ArrayVec::new();
+    output_buffer_ids.push(0);
+    output_buffer_ids.push(1);
+
+    let schedule = Schedule {
+        tasks: Vec::new(),
+        num_buffers: 2,
+        input_buffer_ids: ArrayVec::new(),
+        output_buffer_ids,
+    };
+
+    let compiled_graph = CompiledAudioGraph { schedule, nodes };
 
     let _cpal_out_stream = {
         let host = cpal::default_host();
@@ -28,14 +59,16 @@ fn main() {
 
         let error_callback = |err| eprintln!("an error occurred on output stream: {}", err);
 
-        let mut audio_processor = audio.activate(ActiveServerInfo {
-            sample_rate,
-            max_block_size: MAX_BLOCK_SIZE,
-            num_in_channels: 0,
-            num_out_channels: NonZeroUsize::new(channels).unwrap(),
-        });
+        let mut audio_processor = audio.activate(
+            ActiveServerInfo {
+                sample_rate,
+                num_in_channels: 0,
+                num_out_channels: NonZeroUsize::new(channels).unwrap(),
+            },
+            compiled_graph,
+        );
 
-        let sample_rate_recip = (sample_rate as f64).recip();
+        let sample_rate_recip = audio_processor.cx.sample_rate_recip_f64;
 
         let stream = device
             .build_output_stream(
@@ -79,7 +112,23 @@ fn main() {
     .unwrap();
 }
 
-enum GuiToAudioMsg {}
+pub struct EngineToAudioParamUpdate {
+    /// The id of the node
+    pub node_id: NodeID,
+
+    /// The unique identifier of the parameter
+    pub param_id: crate::node::ParamID,
+
+    /// The new data
+    pub data: crate::node::ParamData,
+
+    /// The instant that this event occurs
+    pub instant: Instant,
+}
+
+enum EngineToAudioMsg {
+    ParamUpdate(EngineToAudioParamUpdate),
+}
 
 struct App {
     audio: AudioResource,
@@ -94,7 +143,7 @@ impl eframe::App for App {
 }
 
 struct ActiveServerState {
-    to_audio_tx: rtrb::Producer<GuiToAudioMsg>,
+    to_audio_tx: rtrb::Producer<EngineToAudioMsg>,
     info: ActiveServerInfo,
 }
 
@@ -110,19 +159,24 @@ impl AudioResource {
     }
 
     /// Activate the audio server with the given parameters.
-    pub fn activate(&mut self, info: ActiveServerInfo) -> AudioProcessor {
-        let (to_audio_tx, from_gui_rx) =
-            rtrb::RingBuffer::<GuiToAudioMsg>::new(GUI_TO_AUDIO_MSG_SIZE);
+    pub fn activate(
+        &mut self,
+        info: ActiveServerInfo,
+        compiled_graph: CompiledAudioGraph,
+    ) -> AudioProcessor {
+        let (to_audio_tx, from_engine_rx) =
+            rtrb::RingBuffer::<EngineToAudioMsg>::new(GUI_TO_AUDIO_MSG_SIZE);
 
         self.active_state = Some(ActiveServerState { to_audio_tx, info });
 
+        let num_buffers = compiled_graph.schedule.num_buffers;
+
         AudioProcessor {
-            from_gui_rx,
-            max_block_size: info.max_block_size,
-            input_channels: vec![vec![0.0; info.max_block_size]; info.num_in_channels],
-            output_channels: vec![vec![0.0; info.max_block_size]; info.num_out_channels.into()],
-            phasor: 0.0,
-            phasor_inc: 440.0 / info.sample_rate as f32,
+            from_engine_rx,
+            buffer_pool: BufferPool::new(num_buffers),
+            node_pool: NodeProcessorPool::new(compiled_graph.nodes),
+            schedule: compiled_graph.schedule,
+            cx: ProcessContext::new(info.sample_rate as f64),
         }
     }
 
@@ -147,8 +201,6 @@ impl AudioResource {
 pub struct ActiveServerInfo {
     /// The sample rate of the stream
     pub sample_rate: u32,
-    /// The maximum block size
-    pub max_block_size: usize,
     /// The number of input channels
     pub num_in_channels: usize,
     /// The number of output channels
@@ -157,71 +209,68 @@ pub struct ActiveServerInfo {
 
 /// The audio-thread part of the audio server.
 pub struct AudioProcessor {
-    from_gui_rx: rtrb::Consumer<GuiToAudioMsg>,
+    from_engine_rx: rtrb::Consumer<EngineToAudioMsg>,
 
-    max_block_size: usize,
+    buffer_pool: BufferPool<MAX_BLOCK_SIZE>,
+    node_pool: NodeProcessorPool,
+    schedule: Schedule,
 
-    input_channels: Vec<Vec<f32>>,
-    output_channels: Vec<Vec<f32>>,
-
-    phasor: f32,
-    phasor_inc: f32,
+    cx: ProcessContext,
 }
 
 impl AudioProcessor {
     /// Process the given buffers.
     pub fn process_interleaved(
         &mut self,
-        input_buffer: &[f32],
-        output_buffer: &mut [f32],
+        input_interleaved: &[f32],
+        output_interleaved: &mut [f32],
         info: &StreamCallbackInfo,
     ) {
-        let frames = output_buffer.len() / self.output_channels.len();
+        while let Ok(msg) = self.from_engine_rx.pop() {
+            match msg {
+                EngineToAudioMsg::ParamUpdate(update) => {
+                    self.node_pool.push_engine_param_update(update);
+                }
+            }
+        }
+
+        let frames = output_interleaved.len() / self.schedule.output_buffer_ids.len();
 
         // Process in blocks
         let mut frames_processed = 0;
         while frames_processed < frames {
-            let block_frames = (frames - frames_processed).min(self.max_block_size);
+            let block_frames = BlockFrames::<MAX_BLOCK_SIZE>::new(
+                (frames - frames_processed).min(MAX_BLOCK_SIZE) as u32,
+            )
+            .unwrap();
 
-            if !self.input_channels.is_empty() {
-                crate::util::deinterleave(
-                    &input_buffer[frames_processed * self.input_channels.len()
-                        ..(frames_processed + block_frames) * self.input_channels.len()],
-                    &mut self.input_channels,
-                );
-            }
+            self.cx.callback_timestamp = info.callback_timestamp;
+            self.cx.output_latency = info.output_latency;
 
-            self.process_block(block_frames, info);
-
-            crate::util::interleave(
-                &self.output_channels,
-                &mut output_buffer[frames_processed * self.output_channels.len()
-                    ..(frames_processed + block_frames) * self.output_channels.len()],
+            self.node_pool.prepare_param_updates(
+                block_frames,
+                info.callback_timestamp
+                    + Duration::from_secs_f64(
+                        frames_processed as f64 * self.cx.sample_rate_recip_f64,
+                    ),
+                self.cx.sample_rate_f64,
+                self.cx.sample_rate_recip_f64,
             );
 
-            frames_processed += block_frames;
-        }
-    }
+            self.schedule.process_block_interleaved(
+                &self.cx,
+                block_frames,
+                &mut self.buffer_pool,
+                &mut self.node_pool,
+                &input_interleaved[frames_processed * self.schedule.input_buffer_ids.len()
+                    ..(frames_processed + block_frames.get() as usize)
+                        * self.schedule.input_buffer_ids.len()],
+                &mut output_interleaved[frames_processed * self.schedule.output_buffer_ids.len()
+                    ..(frames_processed + block_frames.get() as usize)
+                        * self.schedule.output_buffer_ids.len()],
+            );
 
-    fn process_block(&mut self, frames: usize, _info: &StreamCallbackInfo) {
-        let input_silence_mask = SilenceMask::from_channels_slow(&self.input_channels, frames);
-
-        for b in self.output_channels.iter_mut() {
-            b[0..frames].fill(0.0);
-        }
-        let mut output_silence_mask = SilenceMask::new_all_silent(self.output_channels.len());
-
-        let (out_l, out_r) = self.output_channels.split_first_mut().unwrap();
-        let out_l = &mut out_l[0..frames];
-        let out_r = &mut out_r.first_mut().unwrap()[0..frames];
-
-        for (l, r) in out_l.iter_mut().zip(out_r.iter_mut()) {
-            // Generate a sine wave at 440 Hz at 25% volume.
-            let value = (self.phasor * std::f32::consts::TAU).sin() * 0.25;
-            self.phasor = (self.phasor + self.phasor_inc).fract();
-
-            *l = value;
-            *r = value;
+            frames_processed += block_frames.get() as usize;
         }
     }
 }
@@ -240,65 +289,40 @@ pub struct StreamCallbackInfo {
     // pub input_latency: Duration,
 }
 
-/// A mask which specifies which channels contain silence.
-///
-/// This can be used for optimization by skipping processing for inputs
-/// that contain silence.
+/// A value normalized to the range `[0.0, 1.0]`
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SilenceMask(pub u32);
+#[derive(Default, Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct NormalVal(f32);
 
-impl SilenceMask {
-    /// Create a new silence mask from the channels by thouroughly
-    /// checking every sample.
-    pub fn from_channels_slow(channels: &[Vec<f32>], frames: usize) -> Self {
-        if !channels.is_empty() {
-            let mut mask: u32 = 0;
+impl NormalVal {
+    /// A value of `0.0`
+    pub const ZERO: Self = Self(0.0);
+    /// A value of `0.5`
+    pub const HALF: Self = Self(0.5);
+    /// A value of `1.0`
+    pub const ONE: Self = Self(1.0);
 
-            for (ch_i, ch) in channels.iter().enumerate() {
-                let mut is_silent = true;
-
-                for val in &ch[0..frames] {
-                    if *val != 0.0 {
-                        is_silent = false;
-                        break;
-                    }
-                }
-
-                if is_silent {
-                    mask |= 1 << ch_i;
-                }
-            }
-
-            Self(mask)
-        } else {
-            Self(0)
-        }
+    /// Construct a new value normalized to the range `[0.0, 1.0]`.
+    ///
+    /// The value will be clamped to the range `[0.0, 1.0]`.
+    pub fn new(value: f32) -> Self {
+        Self(value.clamp(0.0, 1.0))
     }
 
-    /// Create a new silence mask with all flags set.
-    pub fn new_all_silent(num_channels: usize) -> Self {
-        if num_channels == 0 {
-            Self(0)
-        } else {
-            Self((1 << num_channels) - 1)
-        }
+    /// Get the normalized value in the range `[0.0, 1.0]`
+    pub fn get(&self) -> f32 {
+        self.0
     }
+}
 
-    /// Returns whether or not all flags are set for all channels.
-    pub fn all_channels_silent_fast(&self, channels: &[Vec<f32>]) -> bool {
-        if channels.is_empty() {
-            true
-        } else {
-            let num_channels = channels.len();
-            let all_silent_mask = (1 << num_channels) - 1;
-            self.0 & all_silent_mask == all_silent_mask
-        }
+impl From<f32> for NormalVal {
+    fn from(value: f32) -> Self {
+        Self::new(value)
     }
+}
 
-    /// Returns whether or not the silent flag is set for a given channel.
-    #[inline]
-    pub fn is_channel_silent_fast(&self, index: usize) -> bool {
-        self.0 & (1 << index) != 0
+impl From<NormalVal> for f32 {
+    fn from(value: NormalVal) -> Self {
+        value.get()
     }
 }
