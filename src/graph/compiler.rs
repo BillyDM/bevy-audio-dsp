@@ -11,7 +11,10 @@ pub struct NodeEntry<N> {
     /// The number of output ports used by the node
     pub num_outputs: u16,
     pub weight: N,
-    adjacent: AdjacentEdges,
+    /// The edges connected to this node's input ports.
+    incoming: SmallVec<[Edge; 4]>,
+    /// The edges connected to this node's output ports.
+    outgoing: SmallVec<[Edge; 4]>,
 }
 
 impl<N> NodeEntry<N> {
@@ -21,18 +24,10 @@ impl<N> NodeEntry<N> {
             num_inputs,
             num_outputs,
             weight,
-            adjacent: AdjacentEdges::default(),
+            incoming: SmallVec::new(),
+            outgoing: SmallVec::new(),
         }
     }
-}
-
-/// The edges (port connections) that exist on a given [Node].
-#[derive(Default, Debug, Clone)]
-struct AdjacentEdges {
-    /// The edges connected to this node's input ports.
-    incoming: SmallVec<[Edge; 4]>,
-    /// The edges connected to this node's output ports.
-    outgoing: SmallVec<[Edge; 4]>,
 }
 
 /// A globally unique identifier for a node.
@@ -225,7 +220,7 @@ pub fn compile<'a, N>(
     edges: &mut Arena<Edge>,
 ) -> Result<CompiledSchedule, CompileGraphError> {
     Ok(GraphIR::preprocess(nodes, edges)
-        .sort_topologically()?
+        .sort_topologically(true)?
         .solve_buffer_requirements()?
         .merge())
 }
@@ -234,7 +229,13 @@ pub fn cycle_detected<'a, N>(
     nodes: &'a mut Arena<NodeEntry<N>>,
     edges: &'a mut Arena<Edge>,
 ) -> bool {
-    GraphIR::<N>::preprocess(nodes, edges).tarjan() > 0
+    if let Err(CompileGraphError::CycleDetected) =
+        GraphIR::<N>::preprocess(nodes, edges).sort_topologically(false)
+    {
+        true
+    } else {
+        false
+    }
 }
 
 /// Internal IR used by the compiler algorithm. Built incrementally
@@ -254,13 +255,13 @@ impl<'a, N> GraphIR<'a, N> {
     /// up the adjacency table and creating an empty schedule.
     fn preprocess(nodes: &'a mut Arena<NodeEntry<N>>, edges: &'a mut Arena<Edge>) -> Self {
         for (_, node) in nodes.iter_mut() {
-            node.adjacent.incoming.clear();
-            node.adjacent.outgoing.clear();
+            node.incoming.clear();
+            node.outgoing.clear();
         }
 
         for (_, edge) in edges.iter() {
-            nodes[edge.src_node.0].adjacent.outgoing.push(*edge);
-            nodes[edge.dst_node.0].adjacent.incoming.push(*edge);
+            nodes[edge.src_node.0].outgoing.push(*edge);
+            nodes[edge.dst_node.0].incoming.push(*edge);
         }
 
         Self {
@@ -271,6 +272,62 @@ impl<'a, N> GraphIR<'a, N> {
         }
     }
 
+    /// Sort the nodes topologically using Kahn's algorithm.
+    /// https://www.geeksforgeeks.org/topological-sorting-indegree-based-solution/
+    fn sort_topologically(mut self, build_schedule: bool) -> Result<Self, CompileGraphError> {
+        let mut in_degree = vec![0i32; self.nodes.capacity()];
+        let mut queue = VecDeque::with_capacity(self.nodes.len());
+
+        if build_schedule {
+            self.schedule.reserve(self.nodes.len());
+        }
+
+        let mut num_visited = 0;
+
+        // Calculate in-degree of each vertex
+        for (_, node_entry) in self.nodes.iter() {
+            for edge in node_entry.outgoing.iter() {
+                in_degree[edge.dst_node.0.slot() as usize] += 1;
+            }
+        }
+
+        // Enqueue vertices with 0 in-degree
+        for (node_id, _) in self.nodes.iter() {
+            if in_degree[node_id.slot() as usize] == 0 {
+                queue.push_back(node_id);
+            }
+        }
+
+        // BFS traversal
+        while let Some(node_id) = queue.pop_front() {
+            num_visited += 1;
+
+            let node_entry = &self.nodes[node_id];
+
+            // Reduce in-degree of adjacent vertices
+            for edge in node_entry.outgoing.iter() {
+                in_degree[edge.dst_node.0.slot() as usize] -= 1;
+
+                // If in-degree becomes 0, enqueue it
+                if in_degree[edge.dst_node.0.slot() as usize] == 0 {
+                    queue.push_back(edge.dst_node.0);
+                }
+            }
+
+            if build_schedule {
+                self.schedule.push(ScheduledNode::new(NodeID(node_id)));
+            }
+        }
+
+        // If not all vertices are visited, cycle
+        if num_visited != self.nodes.len() {
+            return Err(CompileGraphError::CycleDetected);
+        }
+
+        Ok(self)
+    }
+
+    /*
     /// Walk the nodes of the graph and add them to the schedule.
     fn sort_topologically(mut self) -> Result<Self, CompileGraphError> {
         if self.tarjan() != 0 {
@@ -278,12 +335,14 @@ impl<'a, N> GraphIR<'a, N> {
         }
 
         let mut queue = VecDeque::with_capacity(self.nodes.len());
+        self.schedule.reserve(self.nodes.len());
+
         // Initialize the queue with roots
         for node in self
             .nodes
             .iter()
             .map(|(_, n)| n)
-            .filter(|n| n.adjacent.incoming.is_empty())
+            .filter(|n| n.incoming.is_empty())
         {
             queue.push_back(node);
         }
@@ -291,7 +350,7 @@ impl<'a, N> GraphIR<'a, N> {
         let mut visited = Arena::<()>::with_capacity(self.nodes.capacity());
 
         while let Some(node) = queue.pop_front() {
-            for next_node_id in node.adjacent.outgoing.iter().map(|e| e.dst_node) {
+            for next_node_id in node.outgoing.iter().map(|e| e.dst_node) {
                 if visited.insert_at(next_node_id.0, ()).is_none() {
                     queue.push_back(&self.nodes[next_node_id.0]);
                 }
@@ -302,6 +361,7 @@ impl<'a, N> GraphIR<'a, N> {
 
         Ok(self)
     }
+    */
 
     fn solve_buffer_requirements(mut self) -> Result<Self, CompileGraphError> {
         let mut allocator = BufferAllocator::new(64);
@@ -335,7 +395,6 @@ impl<'a, N> GraphIR<'a, N> {
                 let port_idx = InPortIdx(port_idx);
 
                 let edges: SmallVec<[&Edge; 4]> = node_entry
-                    .adjacent
                     .incoming
                     .iter()
                     .filter(|edge| edge.dst_port == port_idx)
@@ -374,7 +433,6 @@ impl<'a, N> GraphIR<'a, N> {
                 let port_idx = OutPortIdx(port_idx);
 
                 let edges: SmallVec<[&Edge; 4]> = node_entry
-                    .adjacent
                     .outgoing
                     .iter()
                     .filter(|edge| edge.src_port == port_idx)
@@ -420,127 +478,5 @@ impl<'a, N> GraphIR<'a, N> {
             schedule: self.schedule,
             num_buffers: self.max_num_buffers,
         }
-    }
-
-    /// List the adjacent nodes along outgoing edges of `n`.
-    fn outgoing<'b>(&'b self, n: &'b NodeEntry<N>) -> impl Iterator<Item = &'b NodeEntry<N>> + 'b {
-        n.adjacent
-            .outgoing
-            .iter()
-            .map(move |e| &self.nodes[e.dst_node.0])
-    }
-
-    /*
-    /// List the adjacent nodes along incoming edges of `n`.
-    fn incoming<'b>(&'b self, n: &'b NodeEntry<N>) -> impl Iterator<Item = &'b NodeEntry<N>> + 'b {
-        n.adjacent
-            .incoming
-            .iter()
-            .map(move |e| &self.nodes[e.src_node.0])
-    }
-
-    /// List root nodes, or nodes which have indegree of 0.
-    fn roots(&self) -> impl Iterator<Item = &NodeEntry<N>> + '_ {
-        self.nodes
-            .iter()
-            .map(|n| n.1)
-            .filter(move |n| self.incoming(*n).next().is_none())
-    }
-    */
-
-    /// Count the number of cycles in the graph using Tarjan's algorithm for
-    /// strongly connected components.
-    fn tarjan(&self) -> usize {
-        let mut index = 0;
-        let mut stack = Vec::with_capacity(self.nodes.len());
-
-        #[derive(Default)]
-        struct TarjanData {
-            index: Option<u64>,
-            on_stack: bool,
-            low_link: u64,
-        }
-
-        let mut aux: Arena<TarjanData> = Arena::with_capacity(self.nodes.capacity());
-        for (node_id, _) in self.nodes.iter() {
-            aux.insert_at(node_id, TarjanData::default());
-        }
-
-        let mut num_cycles = 0;
-        fn strong_connect<'a, N>(
-            graph: &'a GraphIR<N>,
-            aux: &mut Arena<TarjanData>,
-            node: &'a NodeEntry<N>,
-            index: &mut u64,
-            stack: &mut Vec<&'a NodeEntry<N>>,
-            outgoing: impl Iterator<Item = &'a NodeEntry<N>> + 'a,
-            num_cycles: &mut usize,
-        ) {
-            let node_aux = aux.get_mut(node.id.0).unwrap();
-            node_aux.index = Some(*index);
-            node_aux.low_link = *index;
-            node_aux.on_stack = true;
-
-            stack.push(node);
-            *index += 1;
-
-            for next in outgoing {
-                let next_node_aux = aux.get(next.id.0).unwrap();
-
-                if next_node_aux.index.is_none() {
-                    strong_connect(
-                        graph,
-                        aux,
-                        next,
-                        index,
-                        stack,
-                        graph.outgoing(next),
-                        num_cycles,
-                    );
-
-                    let next_low_link = aux[next.id.0].low_link;
-
-                    let node_aux = aux.get_mut(node.id.0).unwrap();
-                    node_aux.low_link = node_aux.low_link.min(next_low_link);
-                } else if next_node_aux.on_stack {
-                    let next_index = next_node_aux.index.unwrap();
-
-                    let node_aux = aux.get_mut(node.id.0).unwrap();
-                    node_aux.low_link = node_aux.low_link.min(next_index);
-                }
-            }
-
-            let node_aux = aux.get(node.id.0).unwrap();
-
-            if node_aux.index.unwrap() == node_aux.low_link {
-                let mut scc_count = 0;
-                loop {
-                    if let Some(scc) = stack.pop() {
-                        if scc.id == node.id {
-                            break;
-                        } else {
-                            scc_count += 1;
-                        }
-                    }
-                }
-                if scc_count != 0 {
-                    *num_cycles += 1;
-                }
-            }
-        }
-
-        for (_, node) in self.nodes.iter() {
-            strong_connect(
-                self,
-                &mut aux,
-                node,
-                &mut index,
-                &mut stack,
-                self.outgoing(node),
-                &mut num_cycles,
-            );
-        }
-
-        num_cycles
     }
 }

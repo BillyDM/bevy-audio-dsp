@@ -4,7 +4,7 @@ use ahash::AHashSet;
 use thunderdome::Arena;
 
 use compiler::{
-    compile, BufferIdx, CompiledSchedule, InBufferAssignment, OutBufferAssignment, ScheduledNode,
+    BufferIdx, CompiledSchedule, InBufferAssignment, OutBufferAssignment, ScheduledNode,
 };
 
 pub use compiler::{Edge, EdgeID, InPortIdx, NodeEntry, NodeID, OutPortIdx};
@@ -206,11 +206,14 @@ impl AudioGraph {
     pub fn add_edge(
         &mut self,
         src_node: NodeID,
-        src_port: OutPortIdx,
+        src_port: impl Into<OutPortIdx>,
         dst_node: NodeID,
-        dst_port: InPortIdx,
+        dst_port: impl Into<InPortIdx>,
         check_for_cycles: bool,
     ) -> Result<EdgeID, AddEdgeError> {
+        let src_port: OutPortIdx = src_port.into();
+        let dst_port: InPortIdx = dst_port.into();
+
         let src_node_entry = self
             .nodes
             .get(src_node.0)
@@ -297,6 +300,11 @@ impl AudioGraph {
         }
     }
 
+    /// Get information about the given [Edge]
+    pub fn edge(&self, edge_id: EdgeID) -> Option<&Edge> {
+        self.edges.get(edge_id.0)
+    }
+
     /// Compile the graph into a schedule.
     fn compile(&mut self) -> Result<CompiledSchedule, self::error::CompileGraphError> {
         self.needs_compile = false;
@@ -363,16 +371,19 @@ mod tests {
     use super::*;
     use ahash::AHashSet;
 
+    // Simplest graph test:
+    //
+    //  ┌───┐  ┌───┐
+    //  ┼ 0 ┼──► 1 ┼
+    //  └───┘  └───┘
     #[test]
     fn simplest_graph_compile_test() {
         let mut graph = AudioGraph::new();
 
+        let node0 = graph.add_node(1, 1);
         let node1 = graph.add_node(1, 1);
-        let node2 = graph.add_node(1, 1);
 
-        graph
-            .add_edge(node1, OutPortIdx(0), node2, InPortIdx(0), false)
-            .unwrap();
+        let edge0 = graph.add_edge(node0, 0, node1, 0, false).unwrap();
 
         let schedule = graph.compile().unwrap();
 
@@ -381,24 +392,179 @@ mod tests {
         assert_eq!(schedule.schedule.len(), 2);
         assert!(schedule.num_buffers > 0);
 
-        verify_scheduled_node(&graph, &schedule.schedule[0], node1, &[true]);
-        let edge_src_buffer_idx = schedule.schedule[0].output_buffers[0].buffer_index;
+        // First node must be node 0
+        assert_eq!(schedule.schedule[0].id, node0);
+        // Last node must be node 1
+        assert_eq!(schedule.schedule[1].id, node1);
 
-        verify_scheduled_node(&graph, &schedule.schedule[1], node2, &[false]);
-        let edge_dst_buffer_idx = schedule.schedule[1].input_buffers[0].buffer_index;
+        verify_node(node0, &[true], &schedule, &graph);
+        verify_node(node1, &[false], &schedule, &graph);
 
-        assert_eq!(edge_src_buffer_idx, edge_dst_buffer_idx);
+        verify_edge(edge0, &graph, &schedule);
     }
 
-    // TODO: tests of more complex graphs
+    // Graph compile test 1:
+    //
+    //              ┌───┐  ┌───┐
+    //         ┌────►   ┼──►   │
+    //       ┌─┼─┐  ┼ 3 ┼──►   │
+    //   ┌───►   │  └───┘  │   │  ┌───┐
+    // ┌─┼─┐ │ 1 │  ┌───┐  │ 5 ┼──►   │
+    // │   │ └─┬─┘  ┼   ┼──►   ┼──► 6 │
+    // │ 0 │   └────► 4 ┼──►   │  └───┘
+    // └─┬─┘        └───┘  │   │
+    //   │   ┌───┐         │   │
+    //   └───► 2 ┼─────────►   │
+    //       └───┘         └───┘
+    #[test]
+    fn graph_compile_test_1() {
+        let mut graph = AudioGraph::new();
 
-    fn verify_scheduled_node(
-        graph: &AudioGraph,
-        scheduled_node: &ScheduledNode,
+        let node0 = graph.add_node(0, 2);
+        let node1 = graph.add_node(1, 2);
+        let node2 = graph.add_node(1, 1);
+        let node3 = graph.add_node(2, 2);
+        let node4 = graph.add_node(2, 2);
+        let node5 = graph.add_node(5, 2);
+        let node6 = graph.add_node(2, 0);
+
+        let edge0 = graph.add_edge(node0, 0, node1, 0, false).unwrap();
+        let edge1 = graph.add_edge(node0, 1, node2, 0, false).unwrap();
+        let edge2 = graph.add_edge(node1, 0, node3, 0, false).unwrap();
+        let edge3 = graph.add_edge(node1, 1, node4, 1, false).unwrap();
+        let edge4 = graph.add_edge(node3, 0, node5, 0, false).unwrap();
+        let edge5 = graph.add_edge(node3, 1, node5, 1, false).unwrap();
+        let edge6 = graph.add_edge(node4, 0, node5, 2, false).unwrap();
+        let edge7 = graph.add_edge(node4, 1, node5, 3, false).unwrap();
+        let edge8 = graph.add_edge(node2, 0, node5, 4, false).unwrap();
+        let edge9 = graph.add_edge(node5, 0, node6, 0, false).unwrap();
+        let edge10 = graph.add_edge(node5, 1, node6, 1, false).unwrap();
+
+        let schedule = graph.compile().unwrap();
+
+        dbg!(&schedule);
+
+        assert_eq!(schedule.schedule.len(), 7);
+        // Node 5 needs at-least 7 buffers
+        assert!(schedule.num_buffers > 6);
+
+        // First node must be node 0
+        assert_eq!(schedule.schedule[0].id, node0);
+        // Next two nodes must be 1 and 2
+        assert!(schedule.schedule[1].id == node1 || schedule.schedule[1].id == node2);
+        assert!(schedule.schedule[2].id == node1 || schedule.schedule[2].id == node2);
+        // Next two nodes must be 3 and 4
+        assert!(schedule.schedule[3].id == node3 || schedule.schedule[3].id == node4);
+        assert!(schedule.schedule[4].id == node3 || schedule.schedule[4].id == node4);
+        // Next node must be 5
+        assert_eq!(schedule.schedule[5].id, node5);
+        // Last node must be 6
+        assert_eq!(schedule.schedule[6].id, node6);
+
+        verify_node(node0, &[], &schedule, &graph);
+        verify_node(node1, &[false], &schedule, &graph);
+        verify_node(node2, &[false], &schedule, &graph);
+        verify_node(node3, &[false, true], &schedule, &graph);
+        verify_node(node4, &[true, false], &schedule, &graph);
+        verify_node(
+            node5,
+            &[false, false, false, false, false],
+            &schedule,
+            &graph,
+        );
+        verify_node(node6, &[false, false], &schedule, &graph);
+
+        verify_edge(edge0, &graph, &schedule);
+        verify_edge(edge1, &graph, &schedule);
+        verify_edge(edge2, &graph, &schedule);
+        verify_edge(edge3, &graph, &schedule);
+        verify_edge(edge4, &graph, &schedule);
+        verify_edge(edge5, &graph, &schedule);
+        verify_edge(edge6, &graph, &schedule);
+        verify_edge(edge7, &graph, &schedule);
+        verify_edge(edge8, &graph, &schedule);
+        verify_edge(edge9, &graph, &schedule);
+        verify_edge(edge10, &graph, &schedule);
+    }
+
+    // Graph compile test 2:
+    //
+    //          ┌───┐  ┌───┐
+    //     ┌────►   ┼──►   │
+    //   ┌─┼─┐  ┼ 2 ┼  ┼   │  ┌───┐
+    //   |   │  └───┘  │   ┼──►   │
+    //   │ 0 │  ┌───┐  │ 4 ┼  ┼ 5 │
+    //   └─┬─┘  ┼   ┼  ┼   │  └───┘
+    //     └────► 3 ┼──►   │  ┌───┐
+    //          └───┘  │   ┼──► 6 ┼
+    //   ┌───┐         │   │  └───┘
+    //   ┼ 1 ┼─────────►   ┼
+    //   └───┘         └───┘
+    #[test]
+    fn graph_compile_test_2() {
+        let mut graph = AudioGraph::new();
+
+        let node0 = graph.add_node(0, 2);
+        let node1 = graph.add_node(1, 1);
+        let node2 = graph.add_node(2, 2);
+        let node3 = graph.add_node(2, 2);
+        let node4 = graph.add_node(5, 4);
+        let node5 = graph.add_node(2, 0);
+        let node6 = graph.add_node(1, 1);
+
+        let edge0 = graph.add_edge(node0, 0, node2, 0, false).unwrap();
+        let edge1 = graph.add_edge(node0, 0, node3, 1, false).unwrap();
+        let edge2 = graph.add_edge(node2, 0, node4, 0, false).unwrap();
+        let edge3 = graph.add_edge(node3, 1, node4, 3, false).unwrap();
+        let edge4 = graph.add_edge(node1, 0, node4, 4, false).unwrap();
+        let edge5 = graph.add_edge(node4, 0, node5, 0, false).unwrap();
+        let edge6 = graph.add_edge(node4, 2, node6, 0, false).unwrap();
+
+        let schedule = graph.compile().unwrap();
+
+        dbg!(&schedule);
+
+        assert_eq!(schedule.schedule.len(), 7);
+        // Node 4 needs at-least 8 buffers
+        assert!(schedule.num_buffers > 7);
+
+        // First two nodes must be 1 and 2
+        assert!(schedule.schedule[0].id == node0 || schedule.schedule[0].id == node1);
+        assert!(schedule.schedule[1].id == node0 || schedule.schedule[1].id == node1);
+        // Next two nodes must be 2 and 3
+        assert!(schedule.schedule[2].id == node2 || schedule.schedule[2].id == node3);
+        assert!(schedule.schedule[3].id == node2 || schedule.schedule[3].id == node3);
+        // Next node must be 4
+        assert_eq!(schedule.schedule[4].id, node4);
+        // Last two nodes must be 5 and 6
+        assert!(schedule.schedule[5].id == node5 || schedule.schedule[5].id == node6);
+        assert!(schedule.schedule[6].id == node5 || schedule.schedule[6].id == node6);
+
+        verify_edge(edge0, &graph, &schedule);
+        verify_edge(edge1, &graph, &schedule);
+        verify_edge(edge2, &graph, &schedule);
+        verify_edge(edge3, &graph, &schedule);
+        verify_edge(edge4, &graph, &schedule);
+        verify_edge(edge5, &graph, &schedule);
+        verify_edge(edge6, &graph, &schedule);
+
+        verify_node(node0, &[], &schedule, &graph);
+        verify_node(node1, &[true], &schedule, &graph);
+        verify_node(node2, &[false, true], &schedule, &graph);
+        verify_node(node3, &[true, false], &schedule, &graph);
+        verify_node(node4, &[false, true, true, false, false], &schedule, &graph);
+        verify_node(node5, &[false, true], &schedule, &graph);
+        verify_node(node6, &[false], &schedule, &graph);
+    }
+
+    fn verify_node(
         node_id: NodeID,
         in_ports_that_should_clear: &[bool],
+        schedule: &CompiledSchedule,
+        graph: &AudioGraph,
     ) {
         let node = graph.node(node_id).unwrap();
+        let scheduled_node = schedule.schedule.iter().find(|&s| s.id == node_id).unwrap();
 
         assert_eq!(scheduled_node.id, node_id);
         assert_eq!(scheduled_node.input_buffers.len(), node.num_inputs as usize);
@@ -426,6 +592,31 @@ mod tests {
         for buffer in scheduled_node.output_buffers.iter() {
             assert!(buffer_alias_check.insert(buffer.buffer_index));
         }
+    }
+
+    fn verify_edge(edge_id: EdgeID, graph: &AudioGraph, schedule: &CompiledSchedule) {
+        let edge = graph.edge(edge_id).unwrap();
+
+        let mut src_buffer_idx = None;
+        let mut dst_buffer_idx = None;
+        for node in schedule.schedule.iter() {
+            if node.id == edge.src_node {
+                src_buffer_idx = Some(node.output_buffers[edge.src_port.0 as usize].buffer_index);
+                if dst_buffer_idx.is_some() {
+                    break;
+                }
+            } else if node.id == edge.dst_node {
+                dst_buffer_idx = Some(node.input_buffers[edge.dst_port.0 as usize].buffer_index);
+                if src_buffer_idx.is_some() {
+                    break;
+                }
+            }
+        }
+
+        let src_buffer_idx = src_buffer_idx.unwrap();
+        let dst_buffer_idx = dst_buffer_idx.unwrap();
+
+        assert_eq!(src_buffer_idx, dst_buffer_idx);
     }
 
     #[test]

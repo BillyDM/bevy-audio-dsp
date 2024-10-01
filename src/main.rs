@@ -1,5 +1,5 @@
 mod buffer;
-mod graph;
+pub mod graph;
 mod silence_mask;
 pub mod util;
 
