@@ -1,5 +1,7 @@
 //! General conversion functions and utilities.
 
+use std::cell::{Ref, RefMut};
+
 use crate::SilenceMask;
 
 /// Returns the raw amplitude from the given decibel value.
@@ -43,7 +45,7 @@ pub fn amp_to_db_clamped_neg_100_db(amp: f32) -> f32 {
 /// Efficiently deinterleave audio.
 pub fn deinterleave<const MAX_FRAMES: usize>(
     interleaved: &[f32],
-    channels: &mut [&mut [f32; MAX_FRAMES]],
+    channels: &mut [RefMut<[f32; MAX_FRAMES]>],
 ) {
     match channels.len() {
         0 => return,
@@ -79,28 +81,17 @@ pub fn deinterleave<const MAX_FRAMES: usize>(
 
 /// Efficiently interleave audio.
 pub fn interleave<const MAX_FRAMES: usize>(
-    channels: &[&[f32; MAX_FRAMES]],
+    channels: &[Ref<[f32; MAX_FRAMES]>],
     interleaved: &mut [f32],
-    silence_mask: SilenceMask,
 ) {
     match channels.len() {
         0 => return,
         1 => {
-            if silence_mask.is_channel_silent(0) {
-                interleaved.fill(0.0);
-                return;
-            }
-
             let frames = interleaved.len().min(MAX_FRAMES);
             interleaved.copy_from_slice(&channels[0][0..frames]);
         }
         // Provide a loop with optimized stereo interleaving
         2 => {
-            if silence_mask.all_channels_silent(2) {
-                interleaved.fill(0.0);
-                return;
-            }
-
             let frames = (interleaved.len() / 2).min(MAX_FRAMES);
 
             let ch0 = &channels[0][0..frames];
@@ -121,14 +112,54 @@ pub fn interleave<const MAX_FRAMES: usize>(
             assert!(channels.len() < 64);
 
             for (ch_i, ch) in channels.iter().enumerate() {
-                if silence_mask.is_channel_silent(ch_i) {
-                    continue;
-                }
-
                 for (output, input) in interleaved.iter_mut().skip(ch_i).step_by(n).zip(ch.iter()) {
                     *output = *input;
                 }
             }
         }
     }
+}
+
+/// Recycle the allocation of one Vec for another Vec.
+///
+/// Note, this only works if the types `A` and `B` have the
+/// same size.
+///
+/// This can be useful for realtime code which needs a Vec
+/// of references without allocating. For example:
+/// ```rust
+/// # use bevy_audio_dsp::util::recycle_vec;
+/// #
+/// struct Foo {
+///     buffer_list: Option<Vec<&'static Vec<f32>>>,
+/// }
+///
+/// impl Foo {
+///     pub fn new() -> Self {
+///         Self { buffer_list: Some(Vec::with_capacity(100)) }
+///     }
+///
+///     pub fn realtime_function(&mut self) {
+///         // No allocations or deallocations are made here!
+///         let mut buffer_list: Vec<&Vec<f32>> =
+///             recycle_vec(self.buffer_list.take().unwrap());
+///
+///         // ... use buffer_list ...
+///         assert!(buffer_list.capacity() >= 100);
+///
+///         // Put the buffer back so the allocation can be used again
+///         // for the next call to `realtime_function()`.
+///         self.buffer_list = Some(recycle_vec(buffer_list));
+///     }
+/// }
+///
+/// let mut foo = Foo::new();
+/// foo.realtime_function();
+/// foo.realtime_function();
+/// ```
+pub fn recycle_vec<A, B>(mut v: Vec<A>) -> Vec<B> {
+    debug_assert_eq!(std::mem::size_of::<A>(), std::mem::size_of::<B>());
+
+    v.clear();
+    v.into_iter().map(|_| unreachable!()).collect()
 }

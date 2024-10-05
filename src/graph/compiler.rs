@@ -103,6 +103,14 @@ pub struct CompiledSchedule {
     pub schedule: Vec<ScheduledNode>,
     /// The total number of buffers required to allocate
     pub num_buffers: usize,
+    /// The maximum number of input buffers for a single node.
+    pub max_in_buffers: usize,
+    /// The maximum number of output buffers for a single node.
+    pub max_out_buffers: usize,
+    /// The index into `schedule` for the graph input node.
+    pub graph_in_idx: usize,
+    /// The index into `schedule` for the graph output node.
+    pub graph_out_idx: usize,
 }
 
 /// A [ScheduledNode] is a [Node] that has been assigned buffers
@@ -218,8 +226,10 @@ impl BufferAllocator {
 pub fn compile<'a, N>(
     nodes: &mut Arena<NodeEntry<N>>,
     edges: &mut Arena<Edge>,
+    graph_in_id: NodeID,
+    graph_out_id: NodeID,
 ) -> Result<CompiledSchedule, CompileGraphError> {
-    Ok(GraphIR::preprocess(nodes, edges)
+    Ok(GraphIR::preprocess(nodes, edges, graph_in_id, graph_out_id)
         .sort_topologically(true)?
         .solve_buffer_requirements()?
         .merge())
@@ -228,9 +238,11 @@ pub fn compile<'a, N>(
 pub fn cycle_detected<'a, N>(
     nodes: &'a mut Arena<NodeEntry<N>>,
     edges: &'a mut Arena<Edge>,
+    graph_in_id: NodeID,
+    graph_out_id: NodeID,
 ) -> bool {
     if let Err(CompileGraphError::CycleDetected) =
-        GraphIR::<N>::preprocess(nodes, edges).sort_topologically(false)
+        GraphIR::<N>::preprocess(nodes, edges, graph_in_id, graph_out_id).sort_topologically(false)
     {
         true
     } else {
@@ -248,12 +260,27 @@ struct GraphIR<'a, N> {
     schedule: Vec<ScheduledNode>,
     /// The maximum number of buffers used.
     max_num_buffers: usize,
+
+    graph_in_id: NodeID,
+    graph_out_id: NodeID,
+    graph_in_idx: usize,
+    graph_out_idx: usize,
+    max_in_buffers: usize,
+    max_out_buffers: usize,
 }
 
 impl<'a, N> GraphIR<'a, N> {
     /// Construct a [GraphIR] instance from lists of nodes and edges, building
     /// up the adjacency table and creating an empty schedule.
-    fn preprocess(nodes: &'a mut Arena<NodeEntry<N>>, edges: &'a mut Arena<Edge>) -> Self {
+    fn preprocess(
+        nodes: &'a mut Arena<NodeEntry<N>>,
+        edges: &'a mut Arena<Edge>,
+        graph_in_id: NodeID,
+        graph_out_id: NodeID,
+    ) -> Self {
+        assert!(nodes.contains(graph_in_id.0));
+        assert!(nodes.contains(graph_out_id.0));
+
         for (_, node) in nodes.iter_mut() {
             node.incoming.clear();
             node.outgoing.clear();
@@ -262,6 +289,9 @@ impl<'a, N> GraphIR<'a, N> {
         for (_, edge) in edges.iter() {
             nodes[edge.src_node.0].outgoing.push(*edge);
             nodes[edge.dst_node.0].incoming.push(*edge);
+
+            debug_assert_ne!(edge.src_node, graph_out_id);
+            debug_assert_ne!(edge.dst_node, graph_in_id);
         }
 
         Self {
@@ -269,6 +299,12 @@ impl<'a, N> GraphIR<'a, N> {
             edges,
             schedule: vec![],
             max_num_buffers: 0,
+            graph_in_id,
+            graph_out_id,
+            graph_in_idx: 0,
+            graph_out_idx: 0,
+            max_in_buffers: 0,
+            max_out_buffers: 0,
         }
     }
 
@@ -292,8 +328,8 @@ impl<'a, N> GraphIR<'a, N> {
         }
 
         // Enqueue vertices with 0 in-degree
-        for (node_id, _) in self.nodes.iter() {
-            if in_degree[node_id.slot() as usize] == 0 {
+        for (node_id, node_entry) in self.nodes.iter() {
+            if node_entry.incoming.is_empty() {
                 queue.push_back(node_id);
             }
         }
@@ -315,6 +351,12 @@ impl<'a, N> GraphIR<'a, N> {
             }
 
             if build_schedule {
+                if node_id == self.graph_in_id.0 {
+                    self.graph_in_idx = self.schedule.len();
+                } else if node_id == self.graph_out_id.0 {
+                    self.graph_out_idx = self.schedule.len();
+                }
+
                 self.schedule.push(ScheduledNode::new(NodeID(node_id)));
             }
         }
@@ -326,42 +368,6 @@ impl<'a, N> GraphIR<'a, N> {
 
         Ok(self)
     }
-
-    /*
-    /// Walk the nodes of the graph and add them to the schedule.
-    fn sort_topologically(mut self) -> Result<Self, CompileGraphError> {
-        if self.tarjan() != 0 {
-            return Err(CompileGraphError::CycleDetected);
-        }
-
-        let mut queue = VecDeque::with_capacity(self.nodes.len());
-        self.schedule.reserve(self.nodes.len());
-
-        // Initialize the queue with roots
-        for node in self
-            .nodes
-            .iter()
-            .map(|(_, n)| n)
-            .filter(|n| n.incoming.is_empty())
-        {
-            queue.push_back(node);
-        }
-
-        let mut visited = Arena::<()>::with_capacity(self.nodes.capacity());
-
-        while let Some(node) = queue.pop_front() {
-            for next_node_id in node.outgoing.iter().map(|e| e.dst_node) {
-                if visited.insert_at(next_node_id.0, ()).is_none() {
-                    queue.push_back(&self.nodes[next_node_id.0]);
-                }
-            }
-
-            self.schedule.push(ScheduledNode::new(node.id));
-        }
-
-        Ok(self)
-    }
-    */
 
     fn solve_buffer_requirements(mut self) -> Result<Self, CompileGraphError> {
         let mut allocator = BufferAllocator::new(64);
@@ -466,6 +472,9 @@ impl<'a, N> GraphIR<'a, N> {
             for buffer in buffers_to_release.drain(..) {
                 allocator.release(buffer);
             }
+
+            self.max_in_buffers = self.max_in_buffers.max(node_entry.num_inputs as usize);
+            self.max_out_buffers = self.max_out_buffers.max(node_entry.num_outputs as usize);
         }
 
         self.max_num_buffers = allocator.num_buffers() as usize;
@@ -477,6 +486,10 @@ impl<'a, N> GraphIR<'a, N> {
         CompiledSchedule {
             schedule: self.schedule,
             num_buffers: self.max_num_buffers,
+            graph_in_idx: self.graph_in_idx,
+            graph_out_idx: self.graph_out_idx,
+            max_in_buffers: self.max_in_buffers,
+            max_out_buffers: self.max_out_buffers,
         }
     }
 }

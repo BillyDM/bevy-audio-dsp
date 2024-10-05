@@ -1,16 +1,21 @@
 mod compiler;
 mod error;
+mod executor;
+
 use ahash::AHashSet;
+use error::CompileGraphError;
+use executor::{ExecutorToGraphMsg, GraphToExecutorMsg};
 use thunderdome::Arena;
 
-use compiler::{
-    BufferIdx, CompiledSchedule, InBufferAssignment, OutBufferAssignment, ScheduledNode,
-};
+use compiler::CompiledSchedule;
 
 pub use compiler::{Edge, EdgeID, InPortIdx, NodeEntry, NodeID, OutPortIdx};
 pub use error::AddEdgeError;
+pub use executor::AudioGraphExecutor;
 
-pub struct NodeWeight {}
+use crate::node::{AudioNode, DummyAudioNode};
+
+const CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
 struct EdgeHash {
@@ -20,77 +25,146 @@ struct EdgeHash {
     pub dst_port: InPortIdx,
 }
 
+struct Channel {
+    // TODO: Do research on whether `rtrb` is compatible with
+    // webassembly. If not, use conditional compilation to
+    // use a different channel type when targeting webassembly.
+    to_executor_tx: rtrb::Producer<GraphToExecutorMsg>,
+    from_executor_rx: rtrb::Consumer<ExecutorToGraphMsg>,
+}
+
 /// A helper struct to construct and modify audio graphs.
 pub struct AudioGraph {
-    nodes: Arena<NodeEntry<NodeWeight>>,
+    nodes: Arena<NodeEntry<Box<dyn AudioNode>>>,
     edges: Arena<Edge>,
     connected_input_ports: AHashSet<(NodeID, InPortIdx)>,
     existing_edges: AHashSet<EdgeHash>,
+
+    graph_in_id: NodeID,
+    graph_out_id: NodeID,
+
+    channel: Option<Channel>,
 
     needs_compile: bool,
 }
 
 impl AudioGraph {
-    /// Construct a new [AudioGraph].
-    pub fn new() -> Self {
+    /// Construct a new [AudioGraph] with some initial allocated capacity.
+    fn with_capacity(
+        num_graph_inputs: u16,
+        num_graph_outputs: u16,
+        node_capacity: usize,
+        edge_capacity: usize,
+    ) -> Self {
+        let mut nodes = Arena::<NodeEntry<Box<dyn AudioNode>>>::with_capacity(node_capacity);
+
+        let graph_in_id = NodeID(nodes.insert(NodeEntry::new(
+            0,
+            num_graph_inputs,
+            Box::new(DummyAudioNode),
+        )));
+        let graph_out_id = NodeID(nodes.insert(NodeEntry::new(
+            num_graph_outputs,
+            0,
+            Box::new(DummyAudioNode),
+        )));
+
         Self {
-            nodes: Arena::new(),
-            edges: Arena::new(),
-            connected_input_ports: AHashSet::new(),
-            existing_edges: AHashSet::new(),
+            nodes,
+            edges: Arena::with_capacity(edge_capacity),
+            connected_input_ports: AHashSet::with_capacity(edge_capacity),
+            existing_edges: AHashSet::with_capacity(edge_capacity),
+            graph_in_id,
+            graph_out_id,
+            channel: None,
             needs_compile: false,
         }
     }
 
-    /// Construct a new [AudioGraph] with some initial allocated capacity.
-    pub fn with_capacity(node_capacity: usize, edge_capacity: usize) -> Self {
-        Self {
-            nodes: Arena::with_capacity(node_capacity),
-            edges: Arena::with_capacity(edge_capacity),
-            connected_input_ports: AHashSet::with_capacity(edge_capacity),
-            existing_edges: AHashSet::with_capacity(edge_capacity),
-            needs_compile: false,
+    pub fn create_executor(
+        &mut self,
+        num_stream_in_channels: u16,
+        num_stream_out_channels: u16,
+    ) -> Result<AudioGraphExecutor, CompileGraphError> {
+        if self.channel.is_some() {
+            return Err(CompileGraphError::ExecutorAlreadyExists);
         }
+
+        let (to_executor_tx, from_graph_rx) =
+            rtrb::RingBuffer::<GraphToExecutorMsg>::new(CHANNEL_CAPACITY);
+        let (to_graph_tx, from_executor_rx) =
+            rtrb::RingBuffer::<ExecutorToGraphMsg>::new(CHANNEL_CAPACITY);
+
+        self.channel = Some(Channel {
+            to_executor_tx,
+            from_executor_rx,
+        });
+
+        self.needs_compile = true;
+        self.compile_and_send_schedule()?;
+
+        Ok(AudioGraphExecutor::new(
+            from_graph_rx,
+            to_graph_tx,
+            self.nodes.capacity(),
+            num_stream_in_channels,
+            num_stream_out_channels,
+        ))
+    }
+
+    pub fn on_stream_closed(&mut self, old_executor: Option<AudioGraphExecutor>) {
+        self.channel = None;
+        // Todo: cleanup old executor
+    }
+
+    /// The ID of the graph input node
+    pub fn graph_in_node(&self) -> NodeID {
+        self.graph_in_id
+    }
+
+    /// The ID of the graph output node
+    pub fn graph_out_node(&self) -> NodeID {
+        self.graph_out_id
     }
 
     /// Add a new [Node] the the audio graph.
     ///
     /// This will return the globally unique ID assigned to this node.
-    pub fn add_node(&mut self, num_inputs: u16, num_outputs: u16) -> NodeID {
+    pub fn add_node(&mut self, num_inputs: u16, num_outputs: u16, node: impl AudioNode) -> NodeID {
         self.needs_compile = true;
 
         let new_id = NodeID(self.nodes.insert(NodeEntry::new(
             num_inputs,
             num_outputs,
-            NodeWeight {},
+            Box::new(node),
         )));
         self.nodes[new_id.0].id = new_id;
 
         new_id
     }
 
+    /// Get an immutable reference to the node.
+    ///
+    /// This will return `None` if a node with the given ID does not
+    /// exist in the graph.
+    pub fn node(&self, node_id: NodeID) -> Option<&Box<dyn AudioNode>> {
+        self.nodes.get(node_id.0).map(|n| &n.weight)
+    }
+
+    /// Get a mutable reference to the node.
+    ///
+    /// This will return `None` if a node with the given ID does not
+    /// exist in the graph.
+    pub fn node_mut(&mut self, node_id: NodeID) -> Option<&mut Box<dyn AudioNode>> {
+        self.nodes.get_mut(node_id.0).map(|n| &mut n.weight)
+    }
+
     /// Get info about a node.
     ///
     /// This will return `None` if a node with the given ID does not
     /// exist in the graph.
-    pub fn node(&self, node_id: NodeID) -> Option<&NodeEntry<NodeWeight>> {
+    pub fn node_info(&self, node_id: NodeID) -> Option<&NodeEntry<Box<dyn AudioNode>>> {
         self.nodes.get(node_id.0)
-    }
-
-    /// Get an immutable reference to the node weight.
-    ///
-    /// This will return `None` if a node with the given ID does not
-    /// exist in the graph.
-    pub fn node_weight(&self, node_id: NodeID) -> Option<&NodeWeight> {
-        self.nodes.get(node_id.0).map(|n| &n.weight)
-    }
-
-    /// Get a mutable reference to the node weight.
-    ///
-    /// This will return `None` if a node with the given ID does not
-    /// exist in the graph.
-    pub fn node_weight_mut(&mut self, node_id: NodeID) -> Option<&mut NodeWeight> {
-        self.nodes.get_mut(node_id.0).map(|n| &mut n.weight)
     }
 
     /// Remove the given node from the graph.
@@ -102,8 +176,16 @@ impl AudioGraph {
     /// from the graph as a result of removing this node.
     ///
     /// This will return an error if a node with the given ID does not
-    /// exist in the graph.
-    pub fn remove_node(&mut self, node_id: NodeID) -> Result<(NodeWeight, Vec<EdgeID>), ()> {
+    /// exist in the graph, or if the ID is of the graph input or graph
+    /// output node.
+    pub fn remove_node(
+        &mut self,
+        node_id: NodeID,
+    ) -> Result<(Box<dyn AudioNode>, Vec<EdgeID>), ()> {
+        if node_id == self.graph_in_id || node_id == self.graph_out_id {
+            return Err(());
+        }
+
         let node_entry = self.nodes.remove(node_id.0).ok_or(())?;
 
         let mut removed_edges: Vec<EdgeID> = Vec::new();
@@ -127,7 +209,7 @@ impl AudioGraph {
     }
 
     /// Get a list of all the existing nodes in the graph.
-    pub fn nodes<'a>(&'a self) -> impl Iterator<Item = &'a NodeEntry<NodeWeight>> {
+    pub fn nodes<'a>(&'a self) -> impl Iterator<Item = &'a NodeEntry<Box<dyn AudioNode>>> {
         self.nodes.iter().map(|(_, n)| n)
     }
 
@@ -138,9 +220,13 @@ impl AudioGraph {
 
     /// Set the number of input ports for a particular node in the graph.
     ///
-    /// If this returns an error, then the audio graph has not been
-    /// modified.
+    /// This will return an error if a node with the given ID does not
+    /// exist in the graph, or if the ID is of the graph input node.
     pub fn set_num_inputs(&mut self, node_id: NodeID, num_inputs: u16) -> Result<Vec<EdgeID>, ()> {
+        if node_id == self.graph_in_id {
+            return Err(());
+        }
+
         let node_entry = self.nodes.get_mut(node_id.0).ok_or(())?;
 
         let old_num_inputs = node_entry.num_inputs;
@@ -162,13 +248,17 @@ impl AudioGraph {
 
     /// Set the number of output ports for a particular node in the graph.
     ///
-    /// If this returns an error, then the audio graph has not been
-    /// modified.
+    /// This will return an error if a node with the given ID does not
+    /// exist in the graph, or if the ID is of the graph output node.
     pub fn set_num_outputs(
         &mut self,
         node_id: NodeID,
         num_outputs: u16,
     ) -> Result<Vec<EdgeID>, ()> {
+        if node_id == self.graph_out_id {
+            return Err(());
+        }
+
         let node_entry = self.nodes.get_mut(node_id.0).ok_or(())?;
 
         let old_num_outputs = node_entry.num_outputs;
@@ -305,11 +395,28 @@ impl AudioGraph {
         self.edges.get(edge_id.0)
     }
 
+    fn compile_and_send_schedule(&mut self) -> Result<(), CompileGraphError> {
+        if !self.needs_compile {
+            return Ok(());
+        }
+
+        let schedule = self.compile()?;
+
+        // TODO
+
+        Ok(())
+    }
+
     /// Compile the graph into a schedule.
-    fn compile(&mut self) -> Result<CompiledSchedule, self::error::CompileGraphError> {
+    fn compile(&mut self) -> Result<CompiledSchedule, CompileGraphError> {
         self.needs_compile = false;
 
-        compiler::compile(&mut self.nodes, &mut self.edges)
+        compiler::compile(
+            &mut self.nodes,
+            &mut self.edges,
+            self.graph_in_id,
+            self.graph_out_id,
+        )
     }
 
     /// Returns `true` if `AudioGraph::compile()` should be called
@@ -362,26 +469,32 @@ impl AudioGraph {
     }
 
     fn cycle_detected(&mut self) -> bool {
-        compiler::cycle_detected(&mut self.nodes, &mut self.edges)
+        compiler::cycle_detected(
+            &mut self.nodes,
+            &mut self.edges,
+            self.graph_in_id,
+            self.graph_out_id,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::compiler::BufferIdx;
     use super::*;
     use ahash::AHashSet;
 
-    // Simplest graph test:
+    // Simplest graph compile test:
     //
     //  ┌───┐  ┌───┐
-    //  ┼ 0 ┼──► 1 ┼
+    //  │ 0 ┼──► 1 │
     //  └───┘  └───┘
     #[test]
     fn simplest_graph_compile_test() {
-        let mut graph = AudioGraph::new();
+        let mut graph = AudioGraph::with_capacity(1, 1, 32, 32);
 
-        let node0 = graph.add_node(1, 1);
-        let node1 = graph.add_node(1, 1);
+        let node0 = graph.graph_in_node();
+        let node1 = graph.graph_out_node();
 
         let edge0 = graph.add_edge(node0, 0, node1, 0, false).unwrap();
 
@@ -397,7 +510,7 @@ mod tests {
         // Last node must be node 1
         assert_eq!(schedule.schedule[1].id, node1);
 
-        verify_node(node0, &[true], &schedule, &graph);
+        verify_node(node0, &[], &schedule, &graph);
         verify_node(node1, &[false], &schedule, &graph);
 
         verify_edge(edge0, &graph, &schedule);
@@ -418,15 +531,15 @@ mod tests {
     //       └───┘         └───┘
     #[test]
     fn graph_compile_test_1() {
-        let mut graph = AudioGraph::new();
+        let mut graph = AudioGraph::with_capacity(2, 2, 32, 32);
 
-        let node0 = graph.add_node(0, 2);
-        let node1 = graph.add_node(1, 2);
-        let node2 = graph.add_node(1, 1);
-        let node3 = graph.add_node(2, 2);
-        let node4 = graph.add_node(2, 2);
-        let node5 = graph.add_node(5, 2);
-        let node6 = graph.add_node(2, 0);
+        let node0 = graph.graph_in_node();
+        let node1 = graph.add_node(1, 2, DummyAudioNode);
+        let node2 = graph.add_node(1, 1, DummyAudioNode);
+        let node3 = graph.add_node(2, 2, DummyAudioNode);
+        let node4 = graph.add_node(2, 2, DummyAudioNode);
+        let node5 = graph.add_node(5, 2, DummyAudioNode);
+        let node6 = graph.graph_out_node();
 
         let edge0 = graph.add_edge(node0, 0, node1, 0, false).unwrap();
         let edge1 = graph.add_edge(node0, 1, node2, 0, false).unwrap();
@@ -502,15 +615,15 @@ mod tests {
     //   └───┘         └───┘
     #[test]
     fn graph_compile_test_2() {
-        let mut graph = AudioGraph::new();
+        let mut graph = AudioGraph::with_capacity(2, 2, 32, 32);
 
-        let node0 = graph.add_node(0, 2);
-        let node1 = graph.add_node(1, 1);
-        let node2 = graph.add_node(2, 2);
-        let node3 = graph.add_node(2, 2);
-        let node4 = graph.add_node(5, 4);
-        let node5 = graph.add_node(2, 0);
-        let node6 = graph.add_node(1, 1);
+        let node0 = graph.graph_in_node();
+        let node1 = graph.add_node(1, 1, DummyAudioNode);
+        let node2 = graph.add_node(2, 2, DummyAudioNode);
+        let node3 = graph.add_node(2, 2, DummyAudioNode);
+        let node4 = graph.add_node(5, 4, DummyAudioNode);
+        let node5 = graph.graph_out_node();
+        let node6 = graph.add_node(1, 1, DummyAudioNode);
 
         let edge0 = graph.add_edge(node0, 0, node2, 0, false).unwrap();
         let edge1 = graph.add_edge(node0, 0, node3, 1, false).unwrap();
@@ -563,7 +676,7 @@ mod tests {
         schedule: &CompiledSchedule,
         graph: &AudioGraph,
     ) {
-        let node = graph.node(node_id).unwrap();
+        let node = graph.node_info(node_id).unwrap();
         let scheduled_node = schedule.schedule.iter().find(|&s| s.id == node_id).unwrap();
 
         assert_eq!(scheduled_node.id, node_id);
@@ -621,14 +734,12 @@ mod tests {
 
     #[test]
     fn many_to_one_detection() {
-        let mut graph = AudioGraph::new();
+        let mut graph = AudioGraph::with_capacity(2, 1, 32, 32);
 
-        let node1 = graph.add_node(0, 2);
-        let node2 = graph.add_node(1, 0);
+        let node1 = graph.graph_in_node();
+        let node2 = graph.graph_out_node();
 
-        graph
-            .add_edge(node1, OutPortIdx(0), node2, InPortIdx(0), false)
-            .unwrap();
+        graph.add_edge(node1, 0, node2, 0, false).unwrap();
 
         if let Err(AddEdgeError::InputPortAlreadyConnected(node_id, port_id)) =
             graph.add_edge(node1, OutPortIdx(1), node2, InPortIdx(0), false)
@@ -642,21 +753,15 @@ mod tests {
 
     #[test]
     fn cycle_detection() {
-        let mut graph = AudioGraph::new();
+        let mut graph = AudioGraph::with_capacity(0, 2, 32, 32);
 
-        let node1 = graph.add_node(1, 1);
-        let node2 = graph.add_node(2, 1);
-        let node3 = graph.add_node(1, 1);
+        let node1 = graph.add_node(1, 1, DummyAudioNode);
+        let node2 = graph.add_node(2, 1, DummyAudioNode);
+        let node3 = graph.add_node(1, 1, DummyAudioNode);
 
-        graph
-            .add_edge(node1, OutPortIdx(0), node2, InPortIdx(0), false)
-            .unwrap();
-        graph
-            .add_edge(node2, OutPortIdx(0), node3, InPortIdx(0), false)
-            .unwrap();
-        let edge3 = graph
-            .add_edge(node3, OutPortIdx(0), node1, InPortIdx(0), false)
-            .unwrap();
+        graph.add_edge(node1, 0, node2, 0, false).unwrap();
+        graph.add_edge(node2, 0, node3, 0, false).unwrap();
+        let edge3 = graph.add_edge(node3, 0, node1, 0, false).unwrap();
 
         assert!(graph.cycle_detected());
 
@@ -664,9 +769,7 @@ mod tests {
 
         assert!(!graph.cycle_detected());
 
-        graph
-            .add_edge(node3, OutPortIdx(0), node2, InPortIdx(1), false)
-            .unwrap();
+        graph.add_edge(node3, 0, node2, 1, false).unwrap();
 
         assert!(graph.cycle_detected());
     }

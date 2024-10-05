@@ -106,6 +106,8 @@ pub enum CompileGraphError {
     EdgeIDNotUnique(EdgeID),
     /// The input port has more than one connection.
     ManyToOneError(NodeID, InPortIdx),
+    /// An audio graph executor already exists.
+    ExecutorAlreadyExists,
 }
 
 impl Error for CompileGraphError {}
@@ -127,6 +129,12 @@ impl fmt::Display for CompileGraphError {
             }
             Self::ManyToOneError(node_id, port_id) => {
                 write!(f, "Failed to compile audio graph: input data contains multiple edges that go to the same input port with ID {:?} on node with id {:?}", port_id, node_id)
+            }
+            Self::ExecutorAlreadyExists => {
+                write!(
+                    f,
+                    "Failed to create audio graph executor: Audio graph executor already exists"
+                )
             }
         }
     }

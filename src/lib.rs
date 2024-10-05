@@ -1,8 +1,10 @@
-mod buffer;
+mod backend;
 pub mod graph;
+pub mod node;
 mod silence_mask;
 pub mod util;
 
+pub use backend::AudioBackend;
 pub use silence_mask::SilenceMask;
 
 /// The maximum number of frames that can appear in a processing
@@ -16,6 +18,14 @@ pub use silence_mask::SilenceMask;
 /// audio graph. (The value must also be a power of two.)
 pub const MAX_BLOCK_FRAMES: usize = 256;
 
-pub fn main() {
-    println!("Hello World!");
+pub struct AudioModule<B: AudioBackend> {
+    stream_handle: Option<B::StreamHandle>,
+}
+
+impl<B: AudioBackend> AudioModule<B> {
+    pub fn new() -> Self {
+        Self {
+            stream_handle: None,
+        }
+    }
 }
